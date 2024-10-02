@@ -77,7 +77,7 @@ unsafe extern "system" fn completion_callback(
         // I/O operation completed successfully
         let overlapped = &mut *lpOverlapped;
 
-        // Get the waker from the OVERLAPPED structure (you'll need to store it there)
+        // Get the waker from the OVERLAPPED structure
         let waker: &Waker = std::mem::transmute(overlapped.hEvent);
 
         // Wake up the waker
@@ -133,8 +133,6 @@ impl<'a> Future for AsyncFileRead<'a> {
         }
     }
 }
-
-// Future for asynchronous file writing
 
 impl Drop for AsyncFile {
     fn drop(&mut self) {
