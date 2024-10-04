@@ -4,11 +4,10 @@ use std::io::{self, Result};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use windows::core::Error;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_IO_PENDING, HANDLE, STATUS_END_OF_FILE, WIN32_ERROR,
+    CloseHandle, ERROR_IO_PENDING, HANDLE, STATUS_END_OF_FILE, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, FILE_FLAG_OVERLAPPED};
 use windows::Win32::System::IO::{BindIoCompletionCallback, OVERLAPPED};
@@ -23,17 +22,11 @@ pub struct OverlappedWrap {
     o: OVERLAPPED,
     len: u32,
     err: u32,
-    waker: Option<Arc<Mutex<Waker>>>,
+    waker: Option<Waker>,
 }
 
 impl Default for OverlappedWrap {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OverlappedWrap {
-    pub fn new() -> Self {
         OverlappedWrap {
             o: OVERLAPPED::default(),
             waker: None,
@@ -43,7 +36,7 @@ impl OverlappedWrap {
     }
 }
 
-unsafe extern "system" fn private_callback(
+unsafe extern "system" fn waker_callback(
     dwerrorcode: u32,
     dwnumberofbytestransfered: u32,
     lpoverlapped: *mut OVERLAPPED,
@@ -52,7 +45,10 @@ unsafe extern "system" fn private_callback(
     let wrap: &mut OverlappedWrap = &mut *wrap_ptr;
     wrap.err = dwerrorcode;
     wrap.len = dwnumberofbytestransfered;
-    wrap.waker.as_mut().unwrap().lock().unwrap().clone().wake();
+    // Use take() to avoid potential double-wake panics
+    if let Some(waker) = wrap.waker.take() { 
+        waker.wake();
+    }
 }
 
 impl AsyncFile {
@@ -62,16 +58,20 @@ impl AsyncFile {
             .custom_flags(FILE_FLAG_OVERLAPPED.0)
             .open(path)?;
 
+        // BindIoCompletionCallback is used to have a callback trigger the waker.
         unsafe {
-            BindIoCompletionCallback(HANDLE(file.as_raw_handle()), Some(private_callback), 0)
+            BindIoCompletionCallback(HANDLE(file.as_raw_handle()), Some(waker_callback), 0)
         }?;
 
         Ok(Self { file })
     }
 
-    async fn read(&mut self, buf: &mut [u8], callback: Option<Box<dyn Fn(usize)>>) -> Result<usize> {
+    async fn read_all<F>(&self, buf: &mut [u8], callback: F) -> Result<usize>
+    where
+        F: FnMut(&[u8]),
+    {
         AsyncFileReadFuture {
-            file: self,
+            file: &self.file,
             buf,
             overlapped: OverlappedWrap::default(),
             offset: 0,
@@ -90,20 +90,22 @@ impl AsyncFile {
     }
 }
 
-struct AsyncFileReadFuture<'a> {
-    file: &'a mut AsyncFile,
+struct AsyncFileReadFuture<'a, F> {
+    file: &'a File,
     buf: &'a mut [u8],
     overlapped: OverlappedWrap,
     offset: u64,
-    callback: Option<Box<dyn Fn(usize)>>,
+    callback: F,
 }
 
-impl<'a> Future for AsyncFileReadFuture<'a> {
+impl<'a, F> Future for AsyncFileReadFuture<'a, F>
+where
+    F: FnMut(&[u8]) + 'a,
+{
     type Output = Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        let file = &mut *this.file;
+        let this = unsafe { self.get_unchecked_mut() };        
 
         if this.overlapped.err == STATUS_END_OF_FILE.0 as u32 {
             // End of file
@@ -117,12 +119,10 @@ impl<'a> Future for AsyncFileReadFuture<'a> {
         }
 
         if this.overlapped.len != 0 {
+            // Some data has been read
             let bytes_transferred = this.overlapped.len;
 
-            if let Some(callback) = this.callback.as_mut() {
-                callback(bytes_transferred as usize);
-            }
-            
+            (this.callback)(&this.buf[..bytes_transferred as usize]);
             this.offset += bytes_transferred as u64;
             this.overlapped.o.Anonymous.Anonymous.Offset = this.offset as u32;
             this.overlapped.o.Anonymous.Anonymous.OffsetHigh = (this.offset >> 32) as u32;
@@ -132,7 +132,7 @@ impl<'a> Future for AsyncFileReadFuture<'a> {
         let mut bytes_read = 0;
         let result = unsafe {
             ReadFile(
-                HANDLE(file.file.as_raw_handle()),
+                HANDLE(this.file.as_raw_handle()),
                 Some(this.buf),
                 Some(&mut bytes_read),
                 Some(&mut this.overlapped.o),
@@ -140,19 +140,18 @@ impl<'a> Future for AsyncFileReadFuture<'a> {
         };
 
         if result.is_ok() {
-            if let Some(callback) = this.callback.as_mut() {
-                callback(bytes_read as usize);
-            }
+            // Data was read synchronously
+            (this.callback)(&this.buf[..bytes_read as usize]);
             Poll::Ready(Ok(bytes_read as usize))
         } else {
-            let error = unsafe { GetLastError() };
-            if error == ERROR_IO_PENDING {
-                this.overlapped.waker = Some(Arc::new(Mutex::new(cx.waker().clone())));
+            let error = result.err().expect("Expect error code");
+            if error == Error::from(ERROR_IO_PENDING) {
+                this.overlapped.waker = Some(cx.waker().clone());
                 Poll::Pending
             } else {
                 // Read operation failed
-                println!("Error {:x}", error.0);
-                Poll::Ready(Err(io::Error::from_raw_os_error(error.0 as i32)))
+                println!("Error {:?}", error);
+                Poll::Ready(Err(io::Error::from_raw_os_error(error.code().0 as i32)))
             }
         }
     }
@@ -161,15 +160,21 @@ impl<'a> Future for AsyncFileReadFuture<'a> {
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    let mut buf = Box::new([0u8; 1024 * 64]);
+    // 64K buffer on the stack but could also be on the heap via box.
+    // No heap allocations or buffer copying in this example.
+    let mut buf = [0u8; 1024 * 64];
 
-    // Called every time there is data to process in the supplied buffer.
-    let callback = Box::new(|bytes_transferred: usize| {
-        println!("transferred {} bytes", bytes_transferred);
-    });
+    // Callback allowing processing of data in buf.
+    let callback = |bytes_read: &[u8]| {
+        println!("transferred {} bytes", bytes_read.len());
+    };
 
-    let mut file = AsyncFile::open_for_read("C:/windows/explorer.exe").await?;
-    let bytes_read = file.read(&mut (*buf)[..], Some(callback)).await?;
+    let file = AsyncFile::open_for_read("C:/windows/explorer.exe").await?;
+
+    // Reads the entire file in chunks based on the buffer size.
+    // Only the supplied buffer is used, meaning you must process the data in the callback. 
+    // The buffer is subsequently overwritten with the next chunk.
+    let bytes_read = file.read_all(&mut buf, callback).await?;
 
     println!("Complete {} bytes", bytes_read);
 
