@@ -107,6 +107,11 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };        
 
+        if this.overlapped.waker.is_some() {
+            // still pending
+            return Poll::Pending;
+        }
+
         if this.overlapped.err == STATUS_END_OF_FILE.0 as u32 {
             // End of file
             return Poll::Ready(Ok(this.offset as usize));
@@ -129,6 +134,9 @@ where
             this.overlapped.len = 0;
         }
 
+        // needs to be set before the call to ReadFile to avoid a race
+        this.overlapped.waker = Some(cx.waker().clone());
+
         let mut bytes_read = 0;
         let result = unsafe {
             ReadFile(
@@ -145,8 +153,7 @@ where
             Poll::Ready(Ok(bytes_read as usize))
         } else {
             let error = result.err().expect("Expect error code");
-            if error == Error::from(ERROR_IO_PENDING) {
-                this.overlapped.waker = Some(cx.waker().clone());
+            if error == Error::from(ERROR_IO_PENDING) {                
                 Poll::Pending
             } else {
                 // Read operation failed
